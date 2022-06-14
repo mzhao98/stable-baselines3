@@ -1,0 +1,2 @@
+from stable_baselines3.influence_ppo.policies import CnnPolicy, MlpPolicy, MultiInputPolicy, InfluencePolicy
+from stable_baselines3.influence_ppo.influence_ppo import INFLUENCE_PPO

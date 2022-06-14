@@ -54,6 +54,7 @@ class Monitor(gym.Wrapper):
         self.episode_returns = []
         self.episode_lengths = []
         self.episode_times = []
+        self.episode_actions = []
         self.total_steps = 0
         self.current_reset_info = {}  # extra info about the current episode, that was passed in during reset()
 
@@ -87,7 +88,7 @@ class Monitor(gym.Wrapper):
         """
         if self.needs_reset:
             raise RuntimeError("Tried to step environment that needs reset")
-        observation, reward, done, info = self.env.step(action)
+        observation, obs_for_influence, reward, done, info, all_actions = self.env.step(action)
         self.rewards.append(reward)
         if done:
             self.needs_reset = True
@@ -99,6 +100,7 @@ class Monitor(gym.Wrapper):
             self.episode_returns.append(ep_rew)
             self.episode_lengths.append(ep_len)
             self.episode_times.append(time.time() - self.t_start)
+            self.episode_actions.append(all_actions)
             ep_info.update(self.current_reset_info)
             if self.results_writer:
                 self.results_writer.write_row(ep_info)
