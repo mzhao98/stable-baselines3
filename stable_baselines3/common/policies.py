@@ -475,6 +475,7 @@ class ActorCriticPolicy(BasePolicy):
         self.features_extractor = features_extractor_class(self.observation_space, **self.features_extractor_kwargs)
         self.features_dim = self.features_extractor.features_dim
 
+
         self.normalize_images = normalize_images
         self.log_std_init = log_std_init
         dist_kwargs = None
@@ -604,9 +605,12 @@ class ActorCriticPolicy(BasePolicy):
         # Evaluate the values for the given observations
         values = self.value_net(latent_vf)
         distribution = self._get_action_dist_from_latent(latent_pi)
-        actions = distribution.get_actions(deterministic=deterministic)
+        actions = distribution.get_actions(deterministic=False)
         log_prob = distribution.log_prob(actions)
-        return actions, values, log_prob
+        action_proba_distr = distribution.proba_distribution_from_self()
+
+        return actions, values, log_prob, action_proba_distr
+        # return actions, values, log_prob
 
     def _get_action_dist_from_latent(self, latent_pi: th.Tensor) -> Distribution:
         """
@@ -616,6 +620,7 @@ class ActorCriticPolicy(BasePolicy):
         :return: Action distribution
         """
         mean_actions = self.action_net(latent_pi)
+        # pdb.set_trace()
 
         if isinstance(self.action_dist, DiagGaussianDistribution):
             return self.action_dist.proba_distribution(mean_actions, self.log_std)
@@ -991,7 +996,10 @@ class InfluenceActorCriticPolicy(BasePolicy):
         distribution = self._get_action_dist_from_latent(features)
         actions = distribution.get_actions(deterministic=deterministic)
         log_prob = distribution.log_prob(actions)
-        return actions, values, log_prob
+
+        action_proba_distr = distribution.proba_distribution()
+
+        return actions, values, log_prob, action_proba_distr
 
     def _get_action_dist_from_latent(self, latent_pi: th.Tensor) -> Distribution:
         """

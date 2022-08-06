@@ -95,7 +95,7 @@ class PPO(OnPolicyAlgorithm):
         policy_kwargs: Optional[Dict[str, Any]] = None,
         verbose: int = 0,
         seed: Optional[int] = None,
-        device: Union[th.device, str] = "auto",
+        device: Union[th.device, str] = "cuda:1",
         _init_setup_model: bool = True,
     ):
 
@@ -207,7 +207,7 @@ class PPO(OnPolicyAlgorithm):
                 # Re-sample the noise matrix because the log_std has changed
                 if self.use_sde:
                     self.policy.reset_noise(self.batch_size)
-
+                # print("rollout_data.observations", rollout_data.observations)
                 values, log_prob, entropy = self.policy.evaluate_actions(rollout_data.observations, actions)
                 values = values.flatten()
                 # Normalize advantage
@@ -308,7 +308,7 @@ class PPO(OnPolicyAlgorithm):
         eval_log_path: Optional[str] = None,
         reset_num_timesteps: bool = True,
     ) -> "PPO":
-
+        # print("total_timesteps: ", total_timesteps)
         return super().learn(
             total_timesteps=total_timesteps,
             callback=callback,

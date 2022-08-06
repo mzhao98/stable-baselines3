@@ -1,5 +1,5 @@
 """Probability distributions."""
-
+import pdb
 from abc import ABC, abstractmethod
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -74,6 +74,7 @@ class Distribution(ABC):
         :param deterministic:
         :return:
         """
+        # pdb.set_trace()
         if deterministic:
             return self.mode()
         return self.sample()
@@ -274,6 +275,9 @@ class CategoricalDistribution(Distribution):
         self.distribution = Categorical(logits=action_logits)
         return self
 
+    def proba_distribution_from_self(self):
+        return self.distribution.probs
+
     def log_prob(self, actions: th.Tensor) -> th.Tensor:
         return self.distribution.log_prob(actions)
 
@@ -295,6 +299,18 @@ class CategoricalDistribution(Distribution):
         actions = self.actions_from_params(action_logits)
         log_prob = self.log_prob(actions)
         return actions, log_prob
+
+    def get_actions(self, deterministic: bool = False) -> th.Tensor:
+        """
+        Return actions according to the probability distribution.
+
+        :param deterministic:
+        :return:
+        """
+        # pdb.set_trace()
+        if deterministic:
+            return self.mode()
+        return self.sample()
 
 
 class MultiCategoricalDistribution(Distribution):

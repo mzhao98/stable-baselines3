@@ -11,7 +11,8 @@ from torch.nn import functional as F
 import time
 
 from stable_baselines3.common.on_policy_algorithm import OnPolicyAlgorithm
-from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, MultiInputActorCriticPolicy
+from stable_baselines3.common.policies import ActorCriticCnnPolicy, ActorCriticPolicy, BasePolicy, \
+    MultiInputActorCriticPolicy
 from stable_baselines3.common.type_aliases import GymEnv, MaybeCallback, Schedule
 from stable_baselines3.common.utils import explained_variance, get_schedule_fn
 
@@ -26,9 +27,12 @@ from torch.autograd import Variable
 import sklearn
 import sklearn.metrics
 import warnings
-warnings.filterwarnings("ignore")
 
-class INFLUENCE_PPO(OnPolicyAlgorithm):
+warnings.filterwarnings("ignore")
+from scipy.special import rel_entr
+
+
+class INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER_PRETRAINED_DESIRED(OnPolicyAlgorithm):
     """
     Proximal Policy Optimization algorithm (PPO) (clip version)
 
@@ -88,31 +92,31 @@ class INFLUENCE_PPO(OnPolicyAlgorithm):
     }
 
     def __init__(
-        self,
-        policy: Union[str, Type[ActorCriticPolicy]],
-        env: Union[GymEnv, str],
-        learning_rate: Union[float, Schedule] = 3e-4,
-        n_steps: int = 2048,
-        batch_size: int = 64,
-        n_epochs: int = 10,
-        gamma: float = 0.99,
-        gae_lambda: float = 0.95,
-        clip_range: Union[float, Schedule] = 0.2,
-        clip_range_vf: Union[None, float, Schedule] = None,
-        normalize_advantage: bool = True,
-        ent_coef: float = 0.0,
-        vf_coef: float = 0.5,
-        max_grad_norm: float = 0.5,
-        use_sde: bool = False,
-        sde_sample_freq: int = -1,
-        target_kl: Optional[float] = None,
-        tensorboard_log: Optional[str] = None,
-        create_eval_env: bool = False,
-        policy_kwargs: Optional[Dict[str, Any]] = None,
-        verbose: int = 0,
-        seed: Optional[int] = None,
-        device: Union[th.device, str] = "auto",
-        _init_setup_model: bool = True,
+            self,
+            policy: Union[str, Type[ActorCriticPolicy]],
+            env: Union[GymEnv, str],
+            learning_rate: Union[float, Schedule] = 3e-4,
+            n_steps: int = 2048,
+            batch_size: int = 64,
+            n_epochs: int = 10,
+            gamma: float = 0.99,
+            gae_lambda: float = 0.95,
+            clip_range: Union[float, Schedule] = 0.2,
+            clip_range_vf: Union[None, float, Schedule] = None,
+            normalize_advantage: bool = True,
+            ent_coef: float = 0.0,
+            vf_coef: float = 0.5,
+            max_grad_norm: float = 0.5,
+            use_sde: bool = False,
+            sde_sample_freq: int = -1,
+            target_kl: Optional[float] = None,
+            tensorboard_log: Optional[str] = None,
+            create_eval_env: bool = False,
+            policy_kwargs: Optional[Dict[str, Any]] = None,
+            verbose: int = 0,
+            seed: Optional[int] = None,
+            device: Union[th.device, str] = "cuda:1",
+            _init_setup_model: bool = True,
     ):
 
         super().__init__(
@@ -142,12 +146,11 @@ class INFLUENCE_PPO(OnPolicyAlgorithm):
             ),
         )
 
-
         # Sanity check, otherwise it will lead to noisy gradient and NaN
         # because of the advantage normalization
         if normalize_advantage:
             assert (
-                batch_size > 1
+                    batch_size > 1
             ), "`batch_size` must be greater than 1. See https://github.com/DLR-RM/stable-baselines3/issues/440"
 
         if self.env is not None:
@@ -155,7 +158,7 @@ class INFLUENCE_PPO(OnPolicyAlgorithm):
             # when doing advantage normalization
             buffer_size = self.env.num_envs * self.n_steps
             assert (
-                buffer_size > 1
+                    buffer_size > 1
             ), f"`n_steps * n_envs` must be greater than 1. Currently n_steps={self.n_steps} and n_envs={self.env.num_envs}"
             # Check that the rollout buffer size is a multiple of the mini-batch size
             untruncated_batches = buffer_size // batch_size
@@ -176,12 +179,38 @@ class INFLUENCE_PPO(OnPolicyAlgorithm):
         self.target_kl = target_kl
         self.episode_instance = 0
         self.all_game_data_by_ep = {}
+        self.true_partner_model = None
+        self.desired_partner_policy = None
 
         if _init_setup_model:
             self._setup_model()
 
-    def set_partner_model(self, partner_model):
+    def set_reward_params(self, action_to_one_hot, marginal_probability, desired_strategy):
+        # action_to_one_hot = {0: [1, 0, 0,0], 1: [0, 1, 0,0], 2: [0, 0, 1,0], 3:[0,0,0,1]}
+        # action_to_one_hot = {0: [1, 0, 0], 1: [0, 1, 0], 2: [0, 0, 1]}
+        # action_to_one_hot = {0: [1, 0], 1: [0, 1]}
+        self.action_to_one_hot = action_to_one_hot
+        # marginal_probability = np.array([0, 0])  # np.array([0,0,0])
+        # marginal_probability = np.array([0, 0, 0])
+        # marginal_probability = np.array([0, 0, 0, 0])
+        self.default_marginal_probability = marginal_probability
+
+        # desired_probability = [0.9, 0.1]  # [0,1,0]
+        # desired_probability = [0.01, 0.98, 0.01]
+        # desired_probability = [0.48, 0.01, 0.01, 0.48]
+        self.desired_strategy = desired_strategy
+
+    def set_true_partner(self, true_partner_model):
+        self.true_partner_model = true_partner_model
+
+    def set_desired_partner_policy(self, desired_partner_policy):
+        self.desired_partner_policy = desired_partner_policy
+
+    def set_partner_model(self, partner_model, transform_influence_reward, device):
         self.partner_model = partner_model
+        self.device = device
+        self.partner_model.to(self.device)
+        self.transform_influence_reward = transform_influence_reward
 
     def _setup_model(self) -> None:
         super()._setup_model()
@@ -321,13 +350,12 @@ class INFLUENCE_PPO(OnPolicyAlgorithm):
         self.episode_instance = episode_instance
         self.all_game_data_by_ep[self.episode_instance] = []
 
-
     def collect_rollouts(
-        self,
-        env: VecEnv,
-        callback: BaseCallback,
-        rollout_buffer: RolloutBuffer,
-        n_rollout_steps: int,
+            self,
+            env: VecEnv,
+            callback: BaseCallback,
+            rollout_buffer: RolloutBuffer,
+            n_rollout_steps: int,
     ) -> bool:
         """
         Collect experiences using the current policy and fill a ``RolloutBuffer``.
@@ -355,10 +383,11 @@ class INFLUENCE_PPO(OnPolicyAlgorithm):
         callback.on_rollout_start()
 
         game_outcomes = []
-        self._previous_ego_action = None
+        self._previous_ego_action = [0] * self.action_space.n
         mi_divergence = 0
-        mi_guiding_divergence = 0
-        action_to_one_hot = {0: [1, 0, 0], 1: [0, 1, 0], 2: [0, 0, 1]}
+        mi_guiding_divergence = 1
+
+        self.prev_guidance_divergence = None
 
         while n_steps < n_rollout_steps:
             if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
@@ -368,7 +397,10 @@ class INFLUENCE_PPO(OnPolicyAlgorithm):
             with th.no_grad():
                 # Convert to pytorch tensor or to TensorDict
                 obs_tensor = obs_as_tensor(self._last_obs, self.device)
-                actions, values, log_probs = self.policy(obs_tensor)
+                # pdb.set_trace()
+                actions, values, log_probs, action_proba_distr = self.policy(obs_tensor, deterministic=False)
+
+            # print(f"action_proba_distr: {action_proba_distr}")
             actions = actions.cpu().numpy()
 
             # Rescale and perform action
@@ -380,81 +412,188 @@ class INFLUENCE_PPO(OnPolicyAlgorithm):
             new_obs, rewards, dones, infos = env.step(clipped_actions)
 
             ## Compute new rewards
+            # print("actions", actions)
+            # print("infos", infos)
             # pdb.set_trace()
-            if self._previous_ego_action is not None:
 
-                # new_rewards = copy.deepcopy(rewards)
-
+            # new_rewards = copy.deepcopy(rewards)
+            mi_divergence = 0
+            if self.true_partner_model is not None:
                 # Conditional Probability distribution
                 # see human model prediction
-                input_x = []
-                partner_state = self._previous_ego_action[0]
-                ego_action = actions[0]
+                # Predicting using partner action
+                # state_t = self._last_obs[0].squeeze(axis=1)
+                # state_t1 = new_obs[0].squeeze(axis=1)
+                # ego_action_t = self.action_to_one_hot[actions[0]]
+                # human_pred_input = np.concatenate([ego_action_t, state_t[:-1], state_t1[:-1]], axis=0)  # length = (14,)
+                # human_pred_input = np.expand_dims(np.array([human_pred_input]), axis=2)
+                # if self.true_partner_model is not None:
+                #     pdb.set_trace()
 
-                input_x.extend(action_to_one_hot[partner_state])
-                input_x.extend(action_to_one_hot[ego_action])
+                # obs_np = obs_tensor.cpu().detach().numpy()
+                obs_np = new_obs
+                obs_np = np.squeeze(obs_np, axis=2)
+                obs_np = np.squeeze(obs_np, axis=0)
 
-                input_x = np.expand_dims(np.array([input_x]), axis=2)
-                tensor_input_x = Variable(th.Tensor(input_x))
-
-                # print("tensor_input_x", tensor_input_x.shape)
-
-                predicted_partner_action = self.partner_model(tensor_input_x)
-                predicted_partner_action = predicted_partner_action.detach().numpy()
-
-                conditional_probability = predicted_partner_action[0]/sum(predicted_partner_action[0])
-
-                # Marginal Probability distribution
-                marginal_probability = np.array([0,0,0])
-                for rps_action in action_to_one_hot:
-                    input_x = []
-                    partner_state = self._previous_ego_action[0]
-
-                    input_x.extend(action_to_one_hot[partner_state])
-                    input_x.extend(action_to_one_hot[rps_action])
-
-                    input_x = np.expand_dims(np.array([input_x]), axis=2)
-                    tensor_input_x = Variable(th.Tensor(input_x))
-
-                    # print("tensor_input_x", tensor_input_x.shape)
-
-                    intervention_predicted_partner_action = self.partner_model(tensor_input_x)
-                    intervention_predicted_partner_action = intervention_predicted_partner_action.detach().numpy()[0]
-                    marginal_probability = marginal_probability + intervention_predicted_partner_action
-
-                marginal_probability = marginal_probability/sum(marginal_probability)
+                partner_last_action = obs_np[0:6]
+                ego_last_action = obs_np[6:12]
 
                 # pdb.set_trace()
-                mi_divergence = sklearn.metrics.mutual_info_score(conditional_probability,marginal_probability)
+                # if np.where(ego_last_action == 1) != clipped_actions[0]:
+                # print(f"obs = {obs_np}: {np.where(ego_last_action == 1)} != {clipped_actions[0]}")
+                if 1 in ego_last_action:
+                    assert np.where(ego_last_action == 1) == clipped_actions[0]
 
-                desired_probability = [0,1,0]
-                mi_guiding_divergence = sklearn.metrics.mutual_info_score(conditional_probability, desired_probability)
+                ego_pos = obs_np[12:14]
+                partner_pos = obs_np[14:16]
+                num_apples_left = obs_np[16:17]
+                five_closest = obs_np[17:]
+                apple_locs = [(obs_np[17], obs_np[18]),
+                              (obs_np[19], obs_np[20]),
+                              (obs_np[21], obs_np[22]),
+                              (obs_np[23], obs_np[24]),
+                              (obs_np[25], obs_np[26])]
 
+                obs_from_partner_perspective = []
+                obs_from_partner_perspective.extend(ego_last_action)
+                obs_from_partner_perspective.extend(partner_last_action)
+                obs_from_partner_perspective.extend(partner_pos)
+                obs_from_partner_perspective.extend(ego_pos)
+                obs_from_partner_perspective.extend(num_apples_left)
 
+                closest_apple_locs = []
+                check_apple_positions = []
+                for i in range(len(apple_locs)):
+                    apple_loc = apple_locs[i]
+                    distance_to_player = np.sqrt(
+                        (partner_pos[0] - apple_loc[0]) ** 2 + (partner_pos[1] - apple_loc[1]) ** 2)
+                    check_apple_positions.append((i, distance_to_player))
 
+                check_apple_positions = sorted(check_apple_positions, key=lambda x: x[1])
+                for i in range(5):
+                    if i >= len(check_apple_positions):
+                        closest_apple_locs.extend([0, 0])
+                    else:
+                        apple_idx = check_apple_positions[i][0]
+                        closest_apple_locs.extend([apple_locs[apple_idx][0], apple_locs[apple_idx][1]])
+
+                obs_from_partner_perspective.extend(closest_apple_locs)
+
+                new_partner_obs = np.expand_dims(np.array([obs_from_partner_perspective]), axis=2)
+                tensor_partner_obs = Variable(th.Tensor(new_partner_obs)).to(device=self.device)
+                _, _, _, action_proba_distr = self.true_partner_model.policy(tensor_partner_obs, deterministic=False)
+
+                _, _, _, desired_partner_action_proba_distr = self.desired_partner_policy(tensor_partner_obs, deterministic=False)
+
+                action_proba_distr = action_proba_distr.cpu().detach().numpy()
+                predicted_partner_action = np.squeeze(action_proba_distr, axis=0)
+
+                desired_partner_action_proba_distr = desired_partner_action_proba_distr.cpu().detach().numpy()
+                desired_partner_action_proba_distr = np.squeeze(desired_partner_action_proba_distr, axis=0)
+
+                conditional_probability = predicted_partner_action / sum(predicted_partner_action)
+                desired_conditional_probability = desired_partner_action_proba_distr / sum(desired_partner_action_proba_distr)
+
+                # Marginal Probability distribution
+                marginal_probability = self.default_marginal_probability
+                for candidate_action in self.action_to_one_hot:
+                    # print("ego_action_t init", ego_action_t)
+                    # print("action_to_one_hot", self.action_to_one_hot)
+                    ego_action_t = copy.deepcopy(self.action_to_one_hot[candidate_action])
+                    obs_from_partner_perspective[0:6] = ego_action_t
+
+                    new_partner_obs = np.expand_dims(np.array([obs_from_partner_perspective]), axis=2)
+                    tensor_partner_obs = Variable(th.Tensor(new_partner_obs)).to(device=self.device)
+                    _, _, _, action_proba_distr = self.true_partner_model.policy(tensor_partner_obs,
+                                                                                 deterministic=False)
+                    action_proba_distr = action_proba_distr.cpu().detach().numpy()
+                    intervention_predicted_partner_action = np.squeeze(action_proba_distr, axis=0)
+
+                    marginal_probability = marginal_probability + intervention_predicted_partner_action
+
+                marginal_probability = marginal_probability / sum(marginal_probability)
+
+                # pdb.set_trace()
+                # mi_divergence = sklearn.metrics.mutual_info_score(conditional_probability,marginal_probability)
+                # mi_divergence = sum(rel_entr(conditional_probability, marginal_probability))
+
+                mi_divergence_1 = sum(
+                    rel_entr(marginal_probability, conditional_probability))
+                mi_divergence_2 = sum(
+                    rel_entr(conditional_probability, marginal_probability))
+                mi_divergence = max(mi_divergence_1, mi_divergence_2)
+
+            # print(f"conditional_probability = {conditional_probability}, marginal_probability = {marginal_probability}")
+
+            # mi_guiding_divergence = sklearn.metrics.mutual_info_score(conditional_probability, desired_probability)
+
+            ## Compute divergence from desired strategy
+            # current_position = str((state_t1[0], state_t1[1]))
+            mi_guiding_divergence = 0
+
+            if self.desired_partner_policy is not None and self.true_partner_model is not None:
+                mi_guiding_divergence_1 = sum(
+                    rel_entr(desired_conditional_probability, conditional_probability))
+                mi_guiding_divergence_2 = sum(
+                    rel_entr(conditional_probability, desired_conditional_probability))
+                mi_guiding_divergence = max(mi_guiding_divergence_1, mi_guiding_divergence_2)
+            # if self.desired_strategy is not None:
+            #     desired_action_prob = self.desired_strategy
+            #
+            #     mi_guiding_divergence = sum(rel_entr(conditional_probability, desired_action_prob))
+
+            ##### DONE COMPUTING DIVERGENCES FOR NEW REWARDS
+
+            # print("mi_divergence", mi_divergence)
+            # print("mi_guiding_divergence", mi_guiding_divergence)
+            # pdb.set_trace()
 
             alpha = 0.5
-            beta = 1-alpha
-            gamma = 5
-            modified_reward = alpha * rewards[0] + beta * mi_divergence - gamma * mi_guiding_divergence
+            beta = 10
+            gamma = 20
+            # modified_reward = alpha * rewards[0] + beta * mi_divergence - gamma * mi_guiding_divergence
             # modified_reward = mi_divergence
-            if self._previous_ego_action is None:
-                modified_reward = 0
-            else:
-                modified_reward = 1/(mi_guiding_divergence+0.001)
-            rewards[0] = modified_reward
+            # if self._previous_ego_action is None:
+            #     modified_reward = 0
+            # else:
+            #     modified_reward = 1 / (mi_guiding_divergence)
+            #
+            # if self.prev_guidance_divergence is not None and mi_guiding_divergence < 0.2:
+            #     mi_guiding_divergence_reward = 10
+            # else:
+            #     mi_guiding_divergence_reward = -1
 
+            # mi_guiding_divergence_reward
+
+            # rewards[0] = 1 * mi_divergence + (-100 * np.tan(mi_guiding_divergence - 0.5))
+            # rewards[0] = 1 * mi_divergence + (-np.exp(5*mi_guiding_divergence)) + mi_guiding_divergence_reward
+            env_reward = rewards[0]
+            # rewards[0] =  rewards[0] + 10 * mi_divergence + (-100 * np.tan((mi_guiding_divergence - 0.5) % np.pi))
+            # rewards[0] = rewards[0] + 10 * mi_divergence + (-100 * np.tan( np.clip(mi_guiding_divergence, 0, np.pi/2) - 0.5) )
+            # rewards[0] = rewards[0] + (10 * np.tan(np.clip(mi_divergence, 0, np.pi / 2) - 0.5)) + (-100 * np.tan(np.clip(mi_guiding_divergence, 0, np.pi / 2) - 0.5))
+            # rewards[0] = rewards[0] + (10 * np.tan(np.clip(mi_divergence, 0, np.pi / 2) - 0.5)) + (-100 * np.tan(np.clip(mi_guiding_divergence, 0, np.pi / 2) - 0.5))
+            # mi_guiding_divergence = (100 * np.tan(np.clip(mi_guiding_divergence, 0, np.pi / 2) - 0.5))
+            # rewards[0] = alpha * rewards[0] + beta * mi_divergence - gamma * mi_guiding_divergence
+            rewards[0] = self.transform_influence_reward(env_reward, mi_divergence, mi_guiding_divergence, self.episode_instance)
+
+            new_reward = rewards[0]
+            old_reward = env_reward
+
+            # rewards[0] = alpha * rewards[0] + beta * mi_divergence
+
+            # print(f"env rew: {alpha * env_reward} + influence div: {beta * mi_divergence} + (guiding:{-gamma * mi_guiding_divergence})  ---> rewards[0] :{rewards[0]}")
+
+            # if self.prev_guidance_divergence is None:
+            #     self.prev_guidance_divergence = mi_guiding_divergence
+            #
+            # if mi_guiding_divergence < self.prev_guidance_divergence:
+            #     self.prev_guidance_divergence = mi_guiding_divergence
+
+            # DONE MODIFYING REWARDS
+
+            # Remember previous ego actions
             self._previous_ego_action = actions
             ## Done computing new rewards
-
-            # print("self._last_obs", self._last_obs)
-            # print("clipped_actions", clipped_actions)
-            # print("new_obs, rewards, dones, infos", new_obs, rewards, dones, infos)
-            record_partner_action = new_obs[0]
-            record_ego_action = clipped_actions[0]
-            record_reward = rewards[0]
-            game_outcomes.append((record_ego_action, record_partner_action, record_reward))
-
 
             self.num_timesteps += env.num_envs
 
@@ -474,15 +613,18 @@ class INFLUENCE_PPO(OnPolicyAlgorithm):
             # see GitHub issue #633
             for idx, done in enumerate(dones):
                 if (
-                    done
-                    and infos[idx].get("terminal_observation") is not None
-                    and infos[idx].get("TimeLimit.truncated", False)
+                        done
+                        and infos[idx].get("terminal_observation") is not None
+                        and infos[idx].get("TimeLimit.truncated", False)
                 ):
                     terminal_obs = self.policy.obs_to_tensor(infos[idx]["terminal_observation"])[0]
                     with th.no_grad():
                         terminal_value = self.policy.predict_values(terminal_obs)[0]
                     rewards[idx] += self.gamma * terminal_value
 
+            # actions = actions.cpu().detach().numpy()
+            # values = values.cpu().detach()
+            # log_probs = log_probs.cpu().detach()
             rollout_buffer.add(self._last_obs, actions, rewards, self._last_episode_starts, values, log_probs)
             self._last_obs = new_obs
             self._last_episode_starts = dones
@@ -497,23 +639,20 @@ class INFLUENCE_PPO(OnPolicyAlgorithm):
 
         callback.on_rollout_end()
 
-
-
         return True
 
     def learn(
-        self,
-        total_timesteps: int,
-        callback: MaybeCallback = None,
-        log_interval: int = 1,
-        eval_env: Optional[GymEnv] = None,
-        eval_freq: int = -1,
-        n_eval_episodes: int = 5,
-        tb_log_name: str = "INFLUENCE_PPO",
-        eval_log_path: Optional[str] = None,
-        reset_num_timesteps: bool = True,
+            self,
+            total_timesteps: int,
+            callback: MaybeCallback = None,
+            log_interval: int = 1,
+            eval_env: Optional[GymEnv] = None,
+            eval_freq: int = -1,
+            n_eval_episodes: int = 5,
+            tb_log_name: str = "INFLUENCE_PPO",
+            eval_log_path: Optional[str] = None,
+            reset_num_timesteps: bool = True,
     ) -> "INFLUENCE_PPO":
-
 
         iteration = 0
 

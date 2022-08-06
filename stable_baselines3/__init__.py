@@ -6,7 +6,11 @@ from stable_baselines3.ddpg import DDPG
 from stable_baselines3.dqn import DQN
 from stable_baselines3.her.her_replay_buffer import HerReplayBuffer
 from stable_baselines3.ppo import PPO
-from stable_baselines3.influence_ppo import INFLUENCE_PPO
+# from stable_baselines3.influence_ppo import INFLUENCE_PPO
+from stable_baselines3.influence_ppo import INFLUENCE_PPO_HARVEST_V2, INFLUENCE_PPO_HARVEST_V0, INFLUENCE_PPO_HARVEST_V2, \
+    INFLUENCE_PPO_CP_RPD, INFLUENCE_PPO_CP_RPD_V2, INFLUENCE_PPO_CLEANUP_V0, INFLUENCE_PPO_SIMPLE_CLEANUP_V0, \
+    INFLUENCE_PPO_HARVEST_VECTOR_V0, INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER, \
+    INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER_PRETRAINED_DESIRED
 from stable_baselines3.sac import SAC
 from stable_baselines3.td3 import TD3
 

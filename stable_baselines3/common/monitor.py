@@ -65,6 +65,9 @@ class Monitor(gym.Wrapper):
         :param kwargs: Extra keywords saved for the next episode. only if defined by reset_keywords
         :return: the first observation of the environment
         """
+        # print("**kwargs", **kwargs)
+        # print('kwargs', kwargs)
+
         if not self.allow_early_resets and not self.needs_reset:
             raise RuntimeError(
                 "Tried to reset an environment before done. If you want to allow early resets, "
@@ -88,7 +91,9 @@ class Monitor(gym.Wrapper):
         """
         if self.needs_reset:
             raise RuntimeError("Tried to step environment that needs reset")
-        observation, obs_for_influence, reward, done, info, all_actions = self.env.step(action)
+        observation, obs_for_influence, reward, done, info, all_actions, \
+        partner_action_distr, ego_action_distr, action_successful = self.env.step(action)
+
         self.rewards.append(reward)
         if done:
             self.needs_reset = True
