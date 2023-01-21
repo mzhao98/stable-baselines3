@@ -32,7 +32,7 @@ warnings.filterwarnings("ignore")
 from scipy.special import rel_entr
 
 
-class INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER(OnPolicyAlgorithm):
+class INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER_PRETRAINED_DESIRED_DREAM_INFLUENCE(OnPolicyAlgorithm):
     """
     Proximal Policy Optimization algorithm (PPO) (clip version)
 
@@ -180,6 +180,7 @@ class INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER(OnPolicyAlgorithm):
         self.episode_instance = 0
         self.all_game_data_by_ep = {}
         self.true_partner_model = None
+        self.desired_partner_policy = None
 
         if _init_setup_model:
             self._setup_model()
@@ -202,11 +203,15 @@ class INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER(OnPolicyAlgorithm):
     def set_true_partner(self, true_partner_model):
         self.true_partner_model = true_partner_model
 
-    def set_partner_model(self, partner_model, transform_influence_reward, device):
+    def set_desired_partner_policy(self, desired_partner_policy):
+        self.desired_partner_policy = desired_partner_policy
+
+    def set_partner_model(self, partner_model, transform_influence_reward, transform_influence_reward_w_weights, device):
         self.partner_model = partner_model
         self.device = device
         self.partner_model.to(self.device)
         self.transform_influence_reward = transform_influence_reward
+        self.transform_influence_reward_w_weights = transform_influence_reward_w_weights
 
     def _setup_model(self) -> None:
         super()._setup_model()
@@ -218,6 +223,20 @@ class INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER(OnPolicyAlgorithm):
                 assert self.clip_range_vf > 0, "`clip_range_vf` must be positive, " "pass `None` to deactivate vf clipping"
 
             self.clip_range_vf = get_schedule_fn(self.clip_range_vf)
+
+        # Define candidate weight combinations and separate buffers
+        self.candidate_weights = dict(enumerate([(1, 0, 0), (1, 10, 10), (0, 10, 10), (1, 5, 10), (1, 10, 20)]))
+        self.candidate_buffers = {}
+        for i in self.candidate_weights:
+            self.candidate_buffers[i] = RolloutBuffer(
+                self.n_steps,
+                self.observation_space,
+                self.action_space,
+                device=self.device,
+                gamma=self.gamma,
+                gae_lambda=self.gae_lambda,
+                n_envs=self.n_envs,
+            )
 
     def train(self) -> None:
         """
@@ -342,6 +361,131 @@ class INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER(OnPolicyAlgorithm):
         if self.clip_range_vf is not None:
             self.logger.record("train/clip_range_vf", clip_range_vf)
 
+
+    def hypothetical_train(self, temp_policy, buffer) -> None:
+        """
+        Update policy using the currently gathered rollout buffer.
+        """
+
+        # Switch to train mode (this affects batch norm / dropout)
+        temp_policy.set_training_mode(True)
+        # Update optimizer learning rate
+        self._update_learning_rate(temp_policy.optimizer)
+        # Compute current clip range
+        clip_range = self.clip_range(self._current_progress_remaining)
+        # Optional: clip range for the value function
+        if self.clip_range_vf is not None:
+            clip_range_vf = self.clip_range_vf(self._current_progress_remaining)
+
+        entropy_losses = []
+        pg_losses, value_losses = [], []
+        clip_fractions = []
+
+        continue_training = True
+
+        # train for n_epochs epochs
+        for epoch in range(self.n_epochs):
+            approx_kl_divs = []
+            # Do a complete pass on the rollout buffer
+            for rollout_data in buffer.get(self.batch_size):
+                actions = rollout_data.actions
+                if isinstance(self.action_space, spaces.Discrete):
+                    # Convert discrete action from float to long
+                    actions = rollout_data.actions.long().flatten()
+
+                # Re-sample the noise matrix because the log_std has changed
+                if self.use_sde:
+                    self.policy.reset_noise(self.batch_size)
+
+                values, log_prob, entropy = temp_policy.evaluate_actions(rollout_data.observations, actions)
+                values = values.flatten()
+                # Normalize advantage
+                advantages = rollout_data.advantages
+                if self.normalize_advantage:
+                    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+                # ratio between old and new policy, should be one at the first iteration
+                ratio = th.exp(log_prob - rollout_data.old_log_prob)
+
+                # clipped surrogate loss
+                policy_loss_1 = advantages * ratio
+                policy_loss_2 = advantages * th.clamp(ratio, 1 - clip_range, 1 + clip_range)
+                policy_loss = -th.min(policy_loss_1, policy_loss_2).mean()
+
+                # Logging
+                pg_losses.append(policy_loss.item())
+                clip_fraction = th.mean((th.abs(ratio - 1) > clip_range).float()).item()
+                clip_fractions.append(clip_fraction)
+
+                if self.clip_range_vf is None:
+                    # No clipping
+                    values_pred = values
+                else:
+                    # Clip the different between old and new value
+                    # NOTE: this depends on the reward scaling
+                    values_pred = rollout_data.old_values + th.clamp(
+                        values - rollout_data.old_values, -clip_range_vf, clip_range_vf
+                    )
+                # Value loss using the TD(gae_lambda) target
+                value_loss = F.mse_loss(rollout_data.returns, values_pred)
+                value_losses.append(value_loss.item())
+
+                # Entropy loss favor exploration
+                if entropy is None:
+                    # Approximate entropy when no analytical form
+                    entropy_loss = -th.mean(-log_prob)
+                else:
+                    entropy_loss = -th.mean(entropy)
+
+                entropy_losses.append(entropy_loss.item())
+
+                loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
+
+                # Calculate approximate form of reverse KL Divergence for early stopping
+                # see issue #417: https://github.com/DLR-RM/stable-baselines3/issues/417
+                # and discussion in PR #419: https://github.com/DLR-RM/stable-baselines3/pull/419
+                # and Schulman blog: http://joschu.net/blog/kl-approx.html
+                with th.no_grad():
+                    log_ratio = log_prob - rollout_data.old_log_prob
+                    approx_kl_div = th.mean((th.exp(log_ratio) - 1) - log_ratio).cpu().numpy()
+                    approx_kl_divs.append(approx_kl_div)
+
+                if self.target_kl is not None and approx_kl_div > 1.5 * self.target_kl:
+                    continue_training = False
+                    if self.verbose >= 1:
+                        print(f"Early stopping at step {epoch} due to reaching max kl: {approx_kl_div:.2f}")
+                    break
+
+                # Optimization step
+                temp_policy.optimizer.zero_grad()
+                loss.backward()
+                # Clip grad norm
+                th.nn.utils.clip_grad_norm_(temp_policy.parameters(), self.max_grad_norm)
+                temp_policy.optimizer.step()
+
+            if not continue_training:
+                break
+
+        self._n_updates += self.n_epochs
+        explained_var = explained_variance(buffer.values.flatten(), buffer.returns.flatten())
+
+        # Logs
+        # self.logger.record("train/entropy_loss", np.mean(entropy_losses))
+        # self.logger.record("train/policy_gradient_loss", np.mean(pg_losses))
+        # self.logger.record("train/value_loss", np.mean(value_losses))
+        # self.logger.record("train/approx_kl", np.mean(approx_kl_divs))
+        # self.logger.record("train/clip_fraction", np.mean(clip_fractions))
+        # self.logger.record("train/loss", loss.item())
+        # self.logger.record("train/explained_variance", explained_var)
+        # if hasattr(self.policy, "log_std"):
+        #     self.logger.record("train/std", th.exp(self.policy.log_std).mean().item())
+        #
+        # self.logger.record("train/n_updates", self._n_updates, exclude="tensorboard")
+        # self.logger.record("train/clip_range", clip_range)
+        # if self.clip_range_vf is not None:
+        #     self.logger.record("train/clip_range_vf", clip_range_vf)
+        return temp_policy
+
     def set_episode_instance(self, episode_instance):
         self.episode_instance = episode_instance
         self.all_game_data_by_ep[self.episode_instance] = []
@@ -372,6 +516,11 @@ class INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER(OnPolicyAlgorithm):
 
         n_steps = 0
         rollout_buffer.reset()
+
+
+
+
+
         # Sample new weights for the state dependent exploration
         if self.use_sde:
             self.policy.reset_noise(env.num_envs)
@@ -413,123 +562,130 @@ class INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER(OnPolicyAlgorithm):
             # pdb.set_trace()
 
             # new_rewards = copy.deepcopy(rewards)
+            mi_divergence = 0
+            if self.true_partner_model is not None:
+                # Conditional Probability distribution
+                # see human model prediction
+                # Predicting using partner action
+                # state_t = self._last_obs[0].squeeze(axis=1)
+                # state_t1 = new_obs[0].squeeze(axis=1)
+                # ego_action_t = self.action_to_one_hot[actions[0]]
+                # human_pred_input = np.concatenate([ego_action_t, state_t[:-1], state_t1[:-1]], axis=0)  # length = (14,)
+                # human_pred_input = np.expand_dims(np.array([human_pred_input]), axis=2)
+                # if self.true_partner_model is not None:
+                #     pdb.set_trace()
 
-            # Conditional Probability distribution
-            # see human model prediction
-            # Predicting using partner action
-            # state_t = self._last_obs[0].squeeze(axis=1)
-            # state_t1 = new_obs[0].squeeze(axis=1)
-            # ego_action_t = self.action_to_one_hot[actions[0]]
-            # human_pred_input = np.concatenate([ego_action_t, state_t[:-1], state_t1[:-1]], axis=0)  # length = (14,)
-            # human_pred_input = np.expand_dims(np.array([human_pred_input]), axis=2)
-            # if self.true_partner_model is not None:
-            #     pdb.set_trace()
+                # obs_np = obs_tensor.cpu().detach().numpy()
+                obs_np = new_obs
+                obs_np = np.squeeze(obs_np, axis=2)
+                obs_np = np.squeeze(obs_np, axis=0)
 
-            # obs_np = obs_tensor.cpu().detach().numpy()
-            obs_np = new_obs
-            obs_np = np.squeeze(obs_np, axis=2)
-            obs_np = np.squeeze(obs_np, axis=0)
+                partner_last_action = obs_np[0:6]
+                ego_last_action = obs_np[6:12]
 
-            partner_last_action = obs_np[0:6]
-            ego_last_action = obs_np[6:12]
+                # pdb.set_trace()
+                # if np.where(ego_last_action == 1) != clipped_actions[0]:
+                # print(f"obs = {obs_np}: {np.where(ego_last_action == 1)} != {clipped_actions[0]}")
+                if 1 in ego_last_action:
+                    assert np.where(ego_last_action == 1) == clipped_actions[0]
 
-            # pdb.set_trace()
-            # if np.where(ego_last_action == 1) != clipped_actions[0]:
-            # print(f"obs = {obs_np}: {np.where(ego_last_action == 1)} != {clipped_actions[0]}")
-            if 1 in ego_last_action:
-                assert np.where(ego_last_action == 1) == clipped_actions[0]
+                ego_pos = obs_np[12:14]
+                partner_pos = obs_np[14:16]
+                num_apples_left = obs_np[16:17]
+                five_closest = obs_np[17:]
+                apple_locs = [(obs_np[17], obs_np[18]),
+                              (obs_np[19], obs_np[20]),
+                              (obs_np[21], obs_np[22]),
+                              (obs_np[23], obs_np[24]),
+                              (obs_np[25], obs_np[26])]
 
-            ego_pos = obs_np[12:14]
-            partner_pos = obs_np[14:16]
-            num_apples_left = obs_np[16:17]
-            five_closest = obs_np[17:]
-            apple_locs = [(obs_np[17], obs_np[18]),
-                          (obs_np[19], obs_np[20]),
-                          (obs_np[21], obs_np[22]),
-                          (obs_np[23], obs_np[24]),
-                          (obs_np[25], obs_np[26])]
+                obs_from_partner_perspective = []
+                obs_from_partner_perspective.extend(ego_last_action)
+                obs_from_partner_perspective.extend(partner_last_action)
+                obs_from_partner_perspective.extend(partner_pos)
+                obs_from_partner_perspective.extend(ego_pos)
+                obs_from_partner_perspective.extend(num_apples_left)
 
-            obs_from_partner_perspective = []
-            obs_from_partner_perspective.extend(ego_last_action)
-            obs_from_partner_perspective.extend(partner_last_action)
-            obs_from_partner_perspective.extend(partner_pos)
-            obs_from_partner_perspective.extend(ego_pos)
-            obs_from_partner_perspective.extend(num_apples_left)
+                closest_apple_locs = []
+                check_apple_positions = []
+                for i in range(len(apple_locs)):
+                    apple_loc = apple_locs[i]
+                    distance_to_player = np.sqrt(
+                        (partner_pos[0] - apple_loc[0]) ** 2 + (partner_pos[1] - apple_loc[1]) ** 2)
+                    check_apple_positions.append((i, distance_to_player))
 
-            closest_apple_locs = []
-            check_apple_positions = []
-            for i in range(len(apple_locs)):
-                apple_loc = apple_locs[i]
-                distance_to_player = np.sqrt((partner_pos[0] - apple_loc[0]) ** 2 + (partner_pos[1] - apple_loc[1]) ** 2)
-                check_apple_positions.append((i, distance_to_player))
+                check_apple_positions = sorted(check_apple_positions, key=lambda x: x[1])
+                for i in range(5):
+                    if i >= len(check_apple_positions):
+                        closest_apple_locs.extend([0, 0])
+                    else:
+                        apple_idx = check_apple_positions[i][0]
+                        closest_apple_locs.extend([apple_locs[apple_idx][0], apple_locs[apple_idx][1]])
 
-            check_apple_positions = sorted(check_apple_positions, key=lambda x: x[1])
-            for i in range(5):
-                if i >= len(check_apple_positions):
-                    closest_apple_locs.extend([0, 0])
-                else:
-                    apple_idx = check_apple_positions[i][0]
-                    closest_apple_locs.extend([apple_locs[apple_idx][0], apple_locs[apple_idx][1]])
-
-            obs_from_partner_perspective.extend(closest_apple_locs)
-
-            new_partner_obs = np.expand_dims(np.array([obs_from_partner_perspective]), axis=2)
-            tensor_partner_obs = Variable(th.Tensor(new_partner_obs)).to(device=self.device)
-            _, _, _, action_proba_distr = self.true_partner_model.policy(tensor_partner_obs, deterministic=False)
-            action_proba_distr = action_proba_distr.cpu().detach().numpy()
-            predicted_partner_action = np.squeeze(action_proba_distr, axis=0)
-
-
-            conditional_probability = predicted_partner_action / sum(predicted_partner_action)
-
-            # Marginal Probability distribution
-            marginal_probability = self.default_marginal_probability
-            for candidate_action in self.action_to_one_hot:
-                # print("ego_action_t init", ego_action_t)
-                # print("action_to_one_hot", self.action_to_one_hot)
-                ego_action_t = copy.deepcopy(self.action_to_one_hot[candidate_action])
-                obs_from_partner_perspective[0:6] = ego_action_t
+                obs_from_partner_perspective.extend(closest_apple_locs)
 
                 new_partner_obs = np.expand_dims(np.array([obs_from_partner_perspective]), axis=2)
                 tensor_partner_obs = Variable(th.Tensor(new_partner_obs)).to(device=self.device)
-                _, _, _, action_proba_distr = self.true_partner_model.policy(tensor_partner_obs,
-                                                                                                deterministic=False)
+                _, _, _, action_proba_distr = self.true_partner_model.policy(tensor_partner_obs, deterministic=False)
+
+                _, _, _, desired_partner_action_proba_distr = self.desired_partner_policy(tensor_partner_obs, deterministic=False)
+
                 action_proba_distr = action_proba_distr.cpu().detach().numpy()
-                intervention_predicted_partner_action = np.squeeze(action_proba_distr, axis=0)
+                predicted_partner_action = np.squeeze(action_proba_distr, axis=0)
 
-                marginal_probability = marginal_probability + intervention_predicted_partner_action
+                desired_partner_action_proba_distr = desired_partner_action_proba_distr.cpu().detach().numpy()
+                desired_partner_action_proba_distr = np.squeeze(desired_partner_action_proba_distr, axis=0)
 
-            marginal_probability = marginal_probability / sum(marginal_probability)
+                conditional_probability = predicted_partner_action / sum(predicted_partner_action)
+                desired_conditional_probability = desired_partner_action_proba_distr / sum(desired_partner_action_proba_distr)
 
-            # pdb.set_trace()
-            # mi_divergence = sklearn.metrics.mutual_info_score(conditional_probability,marginal_probability)
-            mi_divergence = sum(rel_entr(conditional_probability, marginal_probability))
+                # Marginal Probability distribution
+                marginal_probability = self.default_marginal_probability
+                for candidate_action in self.action_to_one_hot:
+                    # print("ego_action_t init", ego_action_t)
+                    # print("action_to_one_hot", self.action_to_one_hot)
+                    ego_action_t = copy.deepcopy(self.action_to_one_hot[candidate_action])
+                    obs_from_partner_perspective[0:6] = ego_action_t
+
+                    new_partner_obs = np.expand_dims(np.array([obs_from_partner_perspective]), axis=2)
+                    tensor_partner_obs = Variable(th.Tensor(new_partner_obs)).to(device=self.device)
+                    _, _, _, action_proba_distr = self.true_partner_model.policy(tensor_partner_obs,
+                                                                                 deterministic=False)
+                    action_proba_distr = action_proba_distr.cpu().detach().numpy()
+                    intervention_predicted_partner_action = np.squeeze(action_proba_distr, axis=0)
+
+                    marginal_probability = marginal_probability + intervention_predicted_partner_action
+
+                marginal_probability = marginal_probability / sum(marginal_probability)
+
+                # pdb.set_trace()
+                # mi_divergence = sklearn.metrics.mutual_info_score(conditional_probability,marginal_probability)
+                # mi_divergence = sum(rel_entr(conditional_probability, marginal_probability))
+
+                mi_divergence_1 = sum(
+                    rel_entr(marginal_probability, conditional_probability))
+                mi_divergence_2 = sum(
+                    rel_entr(conditional_probability, marginal_probability))
+                mi_divergence = max(mi_divergence_1, mi_divergence_2)
+
             # print(f"conditional_probability = {conditional_probability}, marginal_probability = {marginal_probability}")
 
             # mi_guiding_divergence = sklearn.metrics.mutual_info_score(conditional_probability, desired_probability)
 
-
             ## Compute divergence from desired strategy
             # current_position = str((state_t1[0], state_t1[1]))
             mi_guiding_divergence = 0
-            # pdb.set_trace()
-            if 5 <= num_apples_left <= 6:
-                desired_action_prob_on_consume_only = [0.001]
-            elif num_apples_left >= 7:
-                desired_action_prob_on_consume_only = [0.5]
-            else:
-                desired_action_prob_on_consume_only = None
 
-            if desired_action_prob_on_consume_only is not None:
-                mi_guiding_divergence_1 = sum(rel_entr([conditional_probability[4]], desired_action_prob_on_consume_only))
-                mi_guiding_divergence_2 = sum(rel_entr(desired_action_prob_on_consume_only, [conditional_probability[4]]))
+            if self.desired_partner_policy is not None and self.true_partner_model is not None:
+                mi_guiding_divergence_1 = sum(
+                    rel_entr(desired_conditional_probability, conditional_probability))
+                mi_guiding_divergence_2 = sum(
+                    rel_entr(conditional_probability, desired_conditional_probability))
                 mi_guiding_divergence = max(mi_guiding_divergence_1, mi_guiding_divergence_2)
             # if self.desired_strategy is not None:
             #     desired_action_prob = self.desired_strategy
             #
             #     mi_guiding_divergence = sum(rel_entr(conditional_probability, desired_action_prob))
-
-                
 
             ##### DONE COMPUTING DIVERGENCES FOR NEW REWARDS
 
@@ -567,7 +723,6 @@ class INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER(OnPolicyAlgorithm):
 
             new_reward = rewards[0]
             old_reward = env_reward
-
 
             # rewards[0] = alpha * rewards[0] + beta * mi_divergence
 
@@ -616,6 +771,19 @@ class INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER(OnPolicyAlgorithm):
             # values = values.cpu().detach()
             # log_probs = log_probs.cpu().detach()
             rollout_buffer.add(self._last_obs, actions, rewards, self._last_episode_starts, values, log_probs)
+
+
+
+            # Recompute for each candidate reward function
+            for c_idx in self.candidate_weights:
+                (c_alpha, c_beta, c_gamma) = self.candidate_weights[c_idx]
+                candidate_rewards = copy.deepcopy(rewards)
+                candidate_rewards[0] = self.transform_influence_reward_w_weights(env_reward, mi_divergence, mi_guiding_divergence,
+                                                             self.episode_instance, c_alpha, c_beta, c_gamma)
+
+
+                self.candidate_buffers[c_idx].add(self._last_obs, actions, candidate_rewards, self._last_episode_starts, values, log_probs)
+
             self._last_obs = new_obs
             self._last_episode_starts = dones
 
@@ -627,9 +795,89 @@ class INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER(OnPolicyAlgorithm):
 
         rollout_buffer.compute_returns_and_advantage(last_values=values, dones=dones)
 
+        for c_idx in self.candidate_weights:
+            self.candidate_buffers[c_idx].compute_returns_and_advantage(last_values=values, dones=dones)
+
         callback.on_rollout_end()
 
         return True
+
+
+    def rollout_environment_reward(
+            self,
+            temp_policy,
+            env: VecEnv,
+            callback: BaseCallback,
+            rollout_buffer: RolloutBuffer,
+            n_rollout_steps: int,
+    ) -> bool:
+        """
+        Collect experiences using the current policy and fill a ``RolloutBuffer``.
+        The term rollout here refers to the model-free notion and should not
+        be used with the concept of rollout used in model-based RL or planning.
+
+        :param env: The training environment
+        :param callback: Callback that will be called at each step
+            (and at the beginning and end of the rollout)
+        :param rollout_buffer: Buffer to fill with rollouts
+        :param n_steps: Number of experiences to collect per environment
+        :return: True if function returned with at least `n_rollout_steps`
+            collected, False if callback terminated rollout prematurely.
+        """
+        assert self._last_obs is not None, "No previous observation was provided"
+        # Switch to eval mode (this affects batch norm / dropout)
+        temp_policy.set_training_mode(False)
+
+        n_steps = 0
+        rollout_buffer.reset()
+
+
+
+
+
+        # Sample new weights for the state dependent exploration
+        if self.use_sde:
+            temp_policy.reset_noise(env.num_envs)
+
+        callback.on_rollout_start()
+
+        total_env_reward = 0
+        while n_steps < n_rollout_steps:
+            if self.use_sde and self.sde_sample_freq > 0 and n_steps % self.sde_sample_freq == 0:
+                # Sample a new noise matrix
+                temp_policy.reset_noise(env.num_envs)
+
+            with th.no_grad():
+                # Convert to pytorch tensor or to TensorDict
+                obs_tensor = obs_as_tensor(self._last_obs, self.device)
+                # pdb.set_trace()
+                actions, values, log_probs, action_proba_distr = temp_policy(obs_tensor, deterministic=False)
+
+            # print(f"action_proba_distr: {action_proba_distr}")
+            actions = actions.cpu().numpy()
+
+            # Rescale and perform action
+            clipped_actions = actions
+            # Clip the actions to avoid out of bound error
+            if isinstance(self.action_space, gym.spaces.Box):
+                clipped_actions = np.clip(actions, self.action_space.low, self.action_space.high)
+
+            new_obs, rewards, dones, infos = env.step(clipped_actions)
+
+            total_env_reward += rewards[0]
+
+            # Give access to local variables
+            callback.update_locals(locals())
+            if callback.on_step() is False:
+                return False
+
+            n_steps += 1
+
+
+
+        callback.on_rollout_end()
+
+        return total_env_reward
 
     def learn(
             self,
@@ -677,6 +925,18 @@ class INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER(OnPolicyAlgorithm):
                 self.logger.record("time/time_elapsed", int(time.time() - self.start_time), exclude="tensorboard")
                 self.logger.record("time/total_timesteps", self.num_timesteps, exclude="tensorboard")
                 self.logger.dump(step=self.num_timesteps)
+
+            best_env_reward = -1000000
+            for c_idx in self.candidate_buffers:
+                temp_policy = copy.deepcopy(self.policy)
+                temp_policy_updated = self.hypothetical_train(temp_policy, self.candidate_buffers[c_idx])
+                candidate_rollout_buffer = copy.deepcopy(self.candidate_buffers[c_idx])
+                total_env_reward = self.rollout_environment_reward(temp_policy, self.env, callback, self.candidate_buffers[c_idx],
+                                                      n_rollout_steps=self.n_steps)
+                if total_env_reward > best_env_reward:
+                    best_env_reward = total_env_reward
+                    self.rollout_buffer = candidate_rollout_buffer
+
 
             self.train()
 

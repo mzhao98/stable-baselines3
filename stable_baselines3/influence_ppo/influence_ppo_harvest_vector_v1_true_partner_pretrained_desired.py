@@ -523,6 +523,8 @@ class INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER_PRETRAINED_DESIRED(OnPolicyAl
                     rel_entr(conditional_probability, marginal_probability))
                 mi_divergence = max(mi_divergence_1, mi_divergence_2)
 
+                mi_guiding_divergence = abs(mi_divergence_1)
+
             # print(f"conditional_probability = {conditional_probability}, marginal_probability = {marginal_probability}")
 
             # mi_guiding_divergence = sklearn.metrics.mutual_info_score(conditional_probability, desired_probability)
@@ -537,6 +539,9 @@ class INFLUENCE_PPO_HARVEST_VECTOR_V1_TRUE_PARTNER_PRETRAINED_DESIRED(OnPolicyAl
                 mi_guiding_divergence_2 = sum(
                     rel_entr(conditional_probability, desired_conditional_probability))
                 mi_guiding_divergence = max(mi_guiding_divergence_1, mi_guiding_divergence_2)
+
+                mi_guiding_divergence = abs(mi_guiding_divergence_1)
+
             # if self.desired_strategy is not None:
             #     desired_action_prob = self.desired_strategy
             #
