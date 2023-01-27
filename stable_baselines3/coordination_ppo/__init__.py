@@ -1,0 +1,8 @@
+from stable_baselines3.coordination_ppo.policies import CnnPolicy, MlpPolicy, MultiInputPolicy, InfluencePolicy
+
+from stable_baselines3.coordination_ppo.simple_collect_v0_vanilla_ppo import VANILLA_PPO_SIMPLE_COLLECT_V0
+
+
+from stable_baselines3.coordination_ppo.true_partner_influence_ppo import SC0_COORD_TRUE_PARTNER
+
+from stable_baselines3.coordination_ppo.learned_partner_influence_ppo import SC0_COORD_LEARNED_PARTNER
